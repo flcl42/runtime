@@ -176,6 +176,9 @@ private:
     bool        TryLowerAddCarry(GenTreeOp* add);
     bool        LowerFullAdders();
     void        LowerCarryChains();
+    void        LowerMaskSelects();
+    bool        TryLowerMaskSelect();
+    bool        TryLowerMaskedXorSwap();
 #ifdef TARGET_AMD64
     void     ReplaceCarryAddressAdd(GenTree* add);
     GenTree* FindMultiplyCarryStore(GenTree* read, bool loopCarry = false);
@@ -183,13 +186,12 @@ private:
     bool     TryLowerMultiplyCarryLoop();
     bool     TryLowerMultiplyCarryChain();
     bool     TryLowerMultiplyCarryRows();
-    void     LowerMaskSelects();
-    bool     TryLowerMaskSelect();
-    bool     TryLowerMaskedXorSwap();
     void     TryLowerMultiplyCarryBackedge();
     void     LowerMultiplyCarryMultiplier();
     void     LowerMultiplyCarryLoads();
 #else
+    void LowerArm64MultiplyCarryRows();
+    bool TryLowerArm64MultiplyCarryRows();
     void LowerArm64MultiplyCarryLoops();
     void TryLowerArm64MultiplyCarryLoop();
 #endif
@@ -702,6 +704,9 @@ private:
     unsigned    m_carryLocalScanBudget = 262144; // Node/block budget for current-IR dead-on-exit proofs.
     unsigned    m_carryUseScanBudget   = 65536;  // Extra node visits beyond the bounded local carry-use scans.
     unsigned    m_maskSelectScanBudget = 65536; // Node visits for the block rescans of LowerMaskSelects.
+#ifdef TARGET_ARM64
+    unsigned    m_arm64RowScanBudget   = 65536; // Reference-link rebuilds after ARM64 row rewrites.
+#endif
 #endif
 
 #ifdef FEATURE_FIXED_OUT_ARGS

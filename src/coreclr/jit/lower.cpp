@@ -9818,15 +9818,14 @@ void Lowering::AfterLowerBlocks()
 #ifdef TARGET_AMD64
         LowerMultiplyCarryLoops();
 #else
+        LowerArm64MultiplyCarryRows();
         LowerArm64MultiplyCarryLoops();
 #endif
     }
-#ifdef TARGET_AMD64
     if (m_compiler->opts.OptimizationEnabled())
     {
         LowerMaskSelects();
     }
-#endif
 #endif
 }
 #endif // !TARGET_WASM
@@ -15097,6 +15096,8 @@ bool Lowering::TryLowerMultiplyCarryRows()
 }
 
 //------------------------------------------------------------------------
+#endif // TARGET_AMD64
+
 // LowerMaskSelects: Turn constant-time selects written with a mask made from a
 // flags bit, or an explicitly masked low bit,
 //     mask = 0 - bit;  r_i = t_i ^ ((t_i ^ s_i) & mask)   (bit from a SETCC)
@@ -15689,6 +15690,7 @@ bool Lowering::TryLowerMaskedXorSwap()
 }
 
 //------------------------------------------------------------------------
+#ifdef TARGET_AMD64
 // FindMultiplyCarryStore: Find a local's sole store and sole read in this block.
 // Ordinary intermediates require a preceding store and cannot be live out.
 // A loop carry may be read before its store and observed on the exit edge.
@@ -16737,7 +16739,36 @@ bool Lowering::IsCarryFlagsCrossing(GenTree* node)
             return false;
     }
 #else
-    return false;
+    // ARM64 integer arithmetic without GTF_SET_FLAGS uses the non-S forms.
+    // Unlike x64, zero constants and address calculations also preserve NZCV.
+    // Keep calls, GC/volatile stores and unchecked intrinsic expansions out.
+    switch (node->OperGet())
+    {
+        case GT_LEA:
+            return true;
+        case GT_CNS_INT:
+        case GT_ADD:
+        case GT_SUB:
+        case GT_MUL:
+        case GT_AND:
+        case GT_OR:
+        case GT_XOR:
+        case GT_NOT:
+        case GT_NEG:
+        case GT_LSH:
+        case GT_RSH:
+        case GT_RSZ:
+            return node->TypeIs(TYP_INT, TYP_LONG, TYP_BYREF) && !node->gtOverflowEx();
+        case GT_IND:
+        case GT_STOREIND:
+            return node->TypeIs(TYP_INT, TYP_LONG) && ((node->gtFlags & GTF_IND_VOLATILE) == 0);
+        case GT_CAST:
+            return !node->gtOverflow() && node->TypeIs(TYP_LONG) && node->AsCast()->CastOp()->TypeIs(TYP_INT);
+        case GT_HWINTRINSIC:
+            return node->AsHWIntrinsic()->GetHWIntrinsicId() == NI_ArmBase_Arm64_MultiplyHigh;
+        default:
+            return false;
+    }
 #endif
 }
 
@@ -17675,6 +17706,299 @@ bool Lowering::TryLowerAddCarry(GenTreeOp* add)
 #endif // defined(TARGET_AMD64) || defined(TARGET_ARM64)
 
 #ifdef TARGET_ARM64
+//------------------------------------------------------------------------
+// LowerArm64MultiplyCarryRows: Keep a row's full-word carry as high + C,
+// rather than draining C into the high word after every limb. Rebuild the
+// reference links after each rewrite; the rescan allowance is method-wide.
+void Lowering::LowerArm64MultiplyCarryRows()
+{
+    if (m_compiler->compHndBBtabCount != 0)
+    {
+        return;
+    }
+    for (BasicBlock* block : m_compiler->Blocks())
+    {
+        m_block = block;
+        while (TryLowerArm64MultiplyCarryRows())
+        {
+        }
+    }
+}
+
+//------------------------------------------------------------------------
+// TryLowerArm64MultiplyCarryRows: Rewrite one straight-line row. Originally
+// each lane is MUL/UMULH, ADDS(lo,t), ADC(hi,0), ADDS(lo,c), ADC(hi,0).
+// Use ADCS(lo,c), ADC(hi,0), ADDS(lo,t), leaving the final carry in NZCV
+// for the next lane. The first lane uses ADDS (there is no pending C), and
+// only the last lane drains C. For B=2^64, x*m+t+c <= B^2-1 proves that
+// the new high+C representation fits one word. Only single-use intermediate
+// values change; product halves and all memory operations stay in place.
+bool Lowering::TryLowerArm64MultiplyCarryRows()
+{
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, GenTree*> NodeMap;
+    CompAllocator alloc = m_compiler->getAllocator(CMK_Lower);
+    NodeMap previous(alloc), next(alloc);
+    typedef JitHashTable<unsigned, JitSmallPrimitiveKeyFuncs<unsigned>, GenTree*> LocalMap;
+    LocalMap last(alloc);
+    for (GenTree* node : BlockRange())
+    {
+        if (m_arm64RowScanBudget == 0)
+        {
+            return false;
+        }
+        m_arm64RowScanBudget--;
+        if (node->OperIsLocal())
+        {
+            unsigned local = node->AsLclVarCommon()->GetLclNum();
+            GenTree* prior = nullptr;
+            if (last.Lookup(local, &prior))
+            {
+                previous.Set(node, prior);
+                next.Set(prior, node);
+            }
+            last.Set(local, node, LocalMap::Overwrite);
+        }
+    }
+    auto safeLocal = [&](GenTree* read) -> bool {
+        if (!read->OperIs(GT_LCL_VAR))
+        {
+            return false;
+        }
+        LclVarDsc* dsc = m_compiler->lvaGetDesc(read->AsLclVar());
+        return !dsc->IsAddressExposed() && !dsc->lvPromoted && !dsc->lvIsStructField;
+    };
+    auto storeFor = [&](GenTree* read) -> GenTree* {
+        if (!safeLocal(read))
+        {
+            return nullptr;
+        }
+        GenTree* prior = read;
+        while (previous.Lookup(prior, &prior))
+        {
+            if (m_arm64RowScanBudget == 0)
+            {
+                return nullptr;
+            }
+            m_arm64RowScanBudget--;
+            if (prior->OperIs(GT_STORE_LCL_VAR))
+            {
+                return prior;
+            }
+        }
+        return nullptr;
+    };
+    auto singleUse = [&](GenTree* read) -> bool {
+        GenTree* prior = nullptr;
+        GenTree* later = nullptr;
+        return safeLocal(read) && previous.Lookup(read, &prior) && prior->OperIs(GT_STORE_LCL_VAR) &&
+               (next.Lookup(read, &later) ? later->OperIs(GT_STORE_LCL_VAR)
+                                         : IsCarryLocalDeadOnExit(read->AsLclVar()->GetLclNum(), m_block));
+    };
+    auto definition = [&](GenTree* read, bool requireSingleUse) -> GenTree* {
+        for (unsigned depth = 0; depth < 4 && read->OperIs(GT_LCL_VAR); depth++)
+        {
+            GenTree* store = storeFor(read);
+            if (store == nullptr || (requireSingleUse && !singleUse(read)))
+            {
+                return nullptr;
+            }
+            read = store->gtGetOp1();
+        }
+        return read;
+    };
+    auto isAdc = [](GenTree* node) -> bool {
+        return node != nullptr && node->OperIs(GT_ADD_CARRY) && node->TypeIs(TYP_LONG) &&
+               !node->gtSetFlags() && node->gtGetOp2()->IsIntegralConst(0);
+    };
+    auto isAdd = [](GenTree* node) -> bool {
+        return node != nullptr && node->OperIs(GT_ADD) && node->TypeIs(TYP_LONG) &&
+               node->gtSetFlags() && !node->gtOverflow() && node->gtGetOp1()->OperIs(GT_LCL_VAR) &&
+               node->gtGetOp2()->OperIs(GT_LCL_VAR);
+    };
+    struct Lane
+    {
+        GenTree* add[2];
+        GenTree* adc[2];
+        GenTree* low;
+        GenTree* partial;
+        GenTree* other[2];
+        GenTree* carry;
+        GenTree* destination;
+    };
+    jitstd::vector<Lane> lanes(alloc);
+    for (GenTree* node : BlockRange())
+    {
+        if (!isAdc(node) || !isAdd(node->gtPrev))
+        {
+            continue;
+        }
+        Lane lane = {};
+        lane.adc[1] = node;
+        lane.add[1] = node->gtPrev;
+        lane.adc[0] = definition(node->gtGetOp1(), true);
+        if (!isAdc(lane.adc[0]) || !isAdd(lane.adc[0]->gtPrev))
+        {
+            continue;
+        }
+        lane.add[0] = lane.adc[0]->gtPrev;
+        GenTree* high = definition(lane.adc[0]->gtGetOp1(), false);
+        if (high == nullptr || !high->OperIs(GT_HWINTRINSIC) ||
+            high->AsHWIntrinsic()->GetHWIntrinsicId() != NI_ArmBase_Arm64_MultiplyHigh ||
+            high->AsHWIntrinsic()->GetSimdBaseType() != TYP_ULONG)
+        {
+            continue;
+        }
+        GenTree* low = nullptr;
+        for (unsigned i = 0; i < 2; i++)
+        {
+            GenTree* operand = i == 0 ? lane.add[0]->gtGetOp1() : lane.add[0]->gtGetOp2();
+            GenTree* product = definition(operand, false);
+            if (product != nullptr && product->OperIs(GT_MUL) && !product->gtOverflow() &&
+                !product->gtSetFlags() && !product->isContained() && product->TypeIs(TYP_LONG))
+            {
+                lane.low = operand;
+                lane.other[0] = i == 0 ? lane.add[0]->gtGetOp2() : lane.add[0]->gtGetOp1();
+                low = product;
+                break;
+            }
+        }
+        if (low == nullptr)
+        {
+            continue;
+        }
+        bool sameProduct = true;
+        for (unsigned i = 1; i <= 2; i++)
+        {
+            GenTree* a = i == 1 ? low->gtGetOp1() : low->gtGetOp2();
+            GenTree* b = high->AsHWIntrinsic()->Op(i);
+            sameProduct &= safeLocal(a) && safeLocal(b) && GenTree::Compare(a, b) && storeFor(a) == storeFor(b);
+        }
+        if (!sameProduct)
+        {
+            continue;
+        }
+        lane.partial = lane.add[1]->gtGetOp1();
+        lane.other[1] = lane.add[1]->gtGetOp2();
+        if (definition(lane.partial, true) != lane.add[0])
+        {
+            std::swap(lane.partial, lane.other[1]);
+        }
+        if (definition(lane.partial, true) != lane.add[0])
+        {
+            continue;
+        }
+        lane.carry = lane.other[1];
+        lane.destination = lane.other[0];
+        lanes.push_back(lane);
+        if (lanes.size() > 128)
+        {
+            return false;
+        }
+    }
+    for (size_t first = 0; first < lanes.size();)
+    {
+        size_t end = first + 1;
+        for (; end < lanes.size(); end++)
+        {
+            Lane& lane = lanes[end];
+            GenTree* prior = lanes[end - 1].adc[1];
+            if (definition(lane.other[1], true) == prior)
+            {
+                lane.carry = lane.other[1];
+                lane.destination = lane.other[0];
+            }
+            else if (definition(lane.other[0], true) == prior)
+            {
+                lane.carry = lane.other[0];
+                lane.destination = lane.other[1];
+            }
+            else
+            {
+                break;
+            }
+        }
+        size_t begin = first;
+        first = end;
+        if (end - begin < 2)
+        {
+            continue;
+        }
+        bool valid = true;
+        // The only relocated node is the carry's local read. Its reaching value
+        // must be unchanged between its old position and the first addition.
+        for (size_t i = begin; valid && i < end; i++)
+        {
+            Lane& lane = lanes[i];
+            if (!safeLocal(lane.carry))
+            {
+                valid = false;
+                break;
+            }
+            if (lane.carry != lane.other[0])
+            {
+                for (GenTree* n = lane.add[0]; n != lane.carry; n = n->gtNext)
+                {
+                    if (n == nullptr || (n->OperIsLocalStore() &&
+                        n->AsLclVarCommon()->GetLclNum() == lane.carry->AsLclVar()->GetLclNum()))
+                    {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+        }
+        GenTree* tail = lanes[end - 1].adc[1];
+        for (GenTree* node = lanes[begin].add[0]; valid && node != tail; node = node->gtNext)
+        {
+            if (m_arm64RowScanBudget == 0)
+            {
+                return false;
+            }
+            m_arm64RowScanBudget--;
+            bool matched = false;
+            for (size_t i = begin; i < end; i++)
+            {
+                matched |= node == lanes[i].add[0] || node == lanes[i].add[1] ||
+                           node == lanes[i].adc[0] || node == lanes[i].adc[1];
+            }
+            valid = node != nullptr && (matched || IsCarryFlagsCrossing(node));
+        }
+        if (!valid || m_arm64RowScanBudget == 0)
+        {
+            continue;
+        }
+        JITDUMP("Keeping ARM64 multiply-accumulate carry in NZCV across %u straight-line lanes\n",
+                (unsigned)(end - begin));
+        for (size_t i = begin; i < end; i++)
+        {
+            Lane& lane = lanes[i];
+            BlockRange().Remove(lane.carry);
+            BlockRange().InsertBefore(lane.add[0], lane.carry);
+            lane.add[0]->AsOp()->gtOp1 = lane.low;
+            lane.add[0]->AsOp()->gtOp2 = lane.carry;
+            if (i != begin)
+            {
+                lane.add[0]->ChangeOper(GT_ADD_CARRY);
+            }
+            lane.add[1]->AsOp()->gtOp1 = lane.partial;
+            lane.add[1]->AsOp()->gtOp2 = lane.destination;
+            if (i + 1 != end)
+            {
+                LIR::Use use;
+                bool found = BlockRange().TryGetUse(lane.adc[1], &use);
+                assert(found);
+                use.ReplaceWith(lane.adc[1]->gtGetOp1());
+                BlockRange().Remove(lane.adc[1]->gtGetOp2());
+                BlockRange().Remove(lane.adc[1]);
+            }
+            ContainCheckBinary(lane.add[0]->AsOp());
+            ContainCheckBinary(lane.add[1]->AsOp());
+        }
+        return true;
+    }
+    return false;
+}
+
 //------------------------------------------------------------------------
 // LowerArm64MultiplyCarryLoops: Keep the last carry of each multiply-accumulate
 // in NZCV until the next limb, including across a counted loop's backedge.
