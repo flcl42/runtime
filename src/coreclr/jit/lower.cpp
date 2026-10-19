@@ -15239,9 +15239,16 @@ bool Lowering::TryLowerMaskSelect()
             cast = value;
             value = value->AsCast()->CastOp();
         }
-        canUseCC = canUseCC && value->OperIs(GT_SETCC) &&
-                   (GenConditionDesc::Get(value->AsCC()->gtCondition).oper == GT_NONE) &&
-                   (value->gtPrev != nullptr) && value->gtPrev->gtSetFlags();
+        bool fromRelop = false;
+#ifdef TARGET_ARM64
+        // Ordinary integer comparisons can feed CSEL directly too. The
+        // comparison remains at its original evaluation point as a CMP.
+        fromRelop = canUseCC && value->OperIsCompare() && value->gtGetOp1()->TypeIs(TYP_INT, TYP_LONG);
+#endif
+        canUseCC = canUseCC &&
+                   (fromRelop || (value->OperIs(GT_SETCC) &&
+                                  (GenConditionDesc::Get(value->AsCC()->gtCondition).oper == GT_NONE) &&
+                                  (value->gtPrev != nullptr) && value->gtPrev->gtSetFlags()));
         bool testBit = !canUseCC;
         if (testBit)
         {
@@ -15255,8 +15262,10 @@ bool Lowering::TryLowerMaskSelect()
             cast = nullptr;
         }
         GenTree*     cc       = testBit ? nullptr : value;
-        GenTree*     producer = testBit ? andOne : cc->gtPrev;
-        GenCondition cond     = testBit ? GenCondition::NE : cc->AsCC()->gtCondition;
+        GenTree*     producer = testBit ? andOne : fromRelop ? cc : cc->gtPrev;
+        GenCondition cond     = testBit     ? GenCondition::NE
+                                : fromRelop ? GenCondition::FromRelop(cc)
+                                            : cc->AsCC()->gtCondition;
 
         // Every read of the mask value must be a select t ^ ((t ^ s) & mask).
         selects.clear();
@@ -15373,6 +15382,19 @@ bool Lowering::TryLowerMaskSelect()
             continue;
         }
 
+#ifdef TARGET_ARM64
+        if (fromRelop)
+        {
+            GenTree* cmp = m_compiler->gtNewOperNode(GT_CMP, TYP_VOID, cc->gtGetOp1(), cc->gtGetOp2());
+            cmp->gtFlags |= GTF_SET_FLAGS;
+            BlockRange().InsertBefore(cc, cmp);
+            cmp->gtGetOp1()->ClearContained();
+            cmp->gtGetOp1()->ClearRegOptional();
+            cmp->gtGetOp2()->ClearContained();
+            cmp->gtGetOp2()->ClearRegOptional();
+            ContainCheckCompare(cmp->AsOp());
+        }
+#endif
         unsigned testedLocal = BAD_VAR_NUM;
         if (testBit)
         {
@@ -16744,8 +16766,12 @@ bool Lowering::IsCarryFlagsCrossing(GenTree* node)
     // Keep calls, GC/volatile stores and unchecked intrinsic expansions out.
     switch (node->OperGet())
     {
+        case GT_LCL_ADDR:
         case GT_LEA:
             return true;
+        case GT_LCL_FLD:
+        case GT_STORE_LCL_FLD:
+            return node->TypeIs(TYP_INT, TYP_LONG, TYP_BYREF);
         case GT_CNS_INT:
         case GT_ADD:
         case GT_SUB:
@@ -17738,6 +17764,8 @@ bool Lowering::TryLowerArm64MultiplyCarryRows()
     typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, GenTree*> NodeMap;
     CompAllocator alloc = m_compiler->getAllocator(CMK_Lower);
     NodeMap previous(alloc), next(alloc);
+    Compiler::NodeToUnsignedMap sequence(alloc);
+    unsigned index = 0;
     typedef JitHashTable<unsigned, JitSmallPrimitiveKeyFuncs<unsigned>, GenTree*> LocalMap;
     LocalMap last(alloc);
     for (GenTree* node : BlockRange())
@@ -17747,6 +17775,7 @@ bool Lowering::TryLowerArm64MultiplyCarryRows()
             return false;
         }
         m_arm64RowScanBudget--;
+        sequence.Set(node, index++);
         if (node->OperIsLocal())
         {
             unsigned local = node->AsLclVarCommon()->GetLclNum();
@@ -17934,16 +17963,23 @@ bool Lowering::TryLowerArm64MultiplyCarryRows()
                 valid = false;
                 break;
             }
-            if (lane.carry != lane.other[0])
+            unsigned readIndex = 0, addIndex = 0;
+            bool found = sequence.Lookup(lane.carry, &readIndex) && sequence.Lookup(lane.add[0], &addIndex);
+            assert(found);
+            GenTree* from = readIndex < addIndex ? lane.carry : lane.add[0];
+            GenTree* to = readIndex < addIndex ? lane.add[0] : lane.carry;
+            for (GenTree* n = from->gtNext; n != to; n = n->gtNext)
             {
-                for (GenTree* n = lane.add[0]; n != lane.carry; n = n->gtNext)
+                if (m_arm64RowScanBudget == 0)
                 {
-                    if (n == nullptr || (n->OperIsLocalStore() &&
-                        n->AsLclVarCommon()->GetLclNum() == lane.carry->AsLclVar()->GetLclNum()))
-                    {
-                        valid = false;
-                        break;
-                    }
+                    return false;
+                }
+                m_arm64RowScanBudget--;
+                if (n == nullptr || (n->OperIsLocalStore() &&
+                    n->AsLclVarCommon()->GetLclNum() == lane.carry->AsLclVar()->GetLclNum()))
+                {
+                    valid = false;
+                    break;
                 }
             }
         }

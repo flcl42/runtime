@@ -702,7 +702,11 @@ private:
     bool        m_hasAddCarry          = false;
     BasicBlock* m_lastSubtractionBlock = nullptr;
     unsigned    m_carryLocalScanBudget = 262144; // Node/block budget for current-IR dead-on-exit proofs.
+#ifdef TARGET_ARM64
+    unsigned    m_carryUseScanBudget   = 1048576; // Unrolled Montgomery kernels have many single-use carry temporaries.
+#else
     unsigned    m_carryUseScanBudget   = 65536;  // Extra node visits beyond the bounded local carry-use scans.
+#endif
     unsigned    m_maskSelectScanBudget = 65536; // Node visits for the block rescans of LowerMaskSelects.
 #ifdef TARGET_ARM64
     unsigned    m_arm64RowScanBudget   = 65536; // Reference-link rebuilds after ARM64 row rewrites.

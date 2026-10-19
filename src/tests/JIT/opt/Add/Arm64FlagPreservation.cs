@@ -9,6 +9,24 @@ using Xunit;
 
 public static class Arm64FlagPreservation
 {
+    private struct Words { public ulong X, Y, Z; }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Expose(ref Words words) { words.Y ^= words.X; }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong StackCarry(ulong x, ulong y, ulong z, out ulong middle, out ulong top)
+    {
+        Words words = new Words { X=x, Y=y, Z=z };
+        Expose(ref words);
+        ulong c = 0;
+        ulong low = Add(x, y, ref c);
+        words.Z = words.X ^ low;
+        middle = Add(words.Y, z, ref c);
+        top = Add(words.Z, x, ref c);
+        return c;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static ulong Add(ulong a, ulong b, ref ulong carry)
     {
@@ -57,6 +75,15 @@ public static class Arm64FlagPreservation
         ulong s = x + y, c = s < x ? 1UL : 0UL;
         Volatile.Write(ref a, s);
         return Volatile.Read(ref b) + c;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong ZeroSelect(ulong x, ulong a, ulong b, out ulong other)
+    {
+        ulong mask = 0UL - (x == 0 ? 1UL : 0UL);
+        ulong first = b ^ ((a ^ b) & mask);
+        other = x ^ ((~a ^ x) & mask);
+        return first;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -131,6 +158,16 @@ public static class Arm64FlagPreservation
                     throw new Exception("Carry across memory/product mismatch");
             }
             ulong u = Next(), v = Next(), bit = Next();
+            BigInteger stack0 = (BigInteger)u + v;
+            BigInteger stack1 = (BigInteger)(u ^ v) + bit + (stack0 >> 64);
+            BigInteger stack2 = (BigInteger)(u ^ (ulong)(stack0 & ulong.MaxValue)) + u + (stack1 >> 64);
+            ulong stackCarry = StackCarry(u, v, bit, out ulong stackMiddle, out ulong stackTop);
+            if (stackCarry != (ulong)(stack2 >> 64) || stackMiddle != (ulong)(stack1 & ulong.MaxValue) ||
+                stackTop != (ulong)(stack2 & ulong.MaxValue))
+                throw new Exception("Carry across stack fields mismatch");
+            ulong zeroResult = ZeroSelect(bit, u, v, out ulong zeroOther);
+            if (zeroResult != (bit == 0 ? u : v) || zeroOther != (bit == 0 ? ~u : bit))
+                throw new Exception("Comparison-mask select mismatch");
             ulong[] outputs = new ulong[3];
             BigInteger product = (BigInteger)u * v;
             ulong low = (ulong)(product & ulong.MaxValue), high = (ulong)(product >> 64);
