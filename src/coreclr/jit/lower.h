@@ -199,6 +199,9 @@ private:
         GenTree* sum, GenTree* restore, GenTree* cc, GenTree* cast, GenTree* store, unsigned carryLocal);
     bool IsCarryOperandAvailable(GenTree* operand, GenTree* producer, GenTree** moveStart);
     bool IsCarryFlagsCrossing(GenTree* node);
+#ifdef TARGET_ARM64
+    bool AreFlagsLiveBefore(GenTree* insertion);
+#endif
 #endif
     GenTree* LowerJTrue(GenTreeOp* jtrue);
 #ifdef TARGET_RISCV64

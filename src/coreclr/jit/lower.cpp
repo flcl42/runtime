@@ -15242,7 +15242,7 @@ bool Lowering::TryLowerMaskSelect()
         bool fromRelop = false;
 #ifdef TARGET_ARM64
         // Ordinary integer comparisons can feed CSEL directly too. The
-        // comparison remains at its original evaluation point as a CMP.
+        // comparison remains at its original evaluation point as a CMP or TEST.
         fromRelop = canUseCC && value->OperIsCompare() && value->gtGetOp1()->TypeIs(TYP_INT, TYP_LONG);
 #endif
         canUseCC = canUseCC &&
@@ -15383,9 +15383,24 @@ bool Lowering::TryLowerMaskSelect()
         }
 
 #ifdef TARGET_ARM64
+        // Carry forwarding and multiply-row lowering have already run. A new
+        // CMP/TEST must not overwrite flags that their consumers still need.
+        bool flagsLive = fromRelop && AreFlagsLiveBefore(cc);
+        if (testBit)
+        {
+            for (const Select& select : selects)
+            {
+                flagsLive |= AreFlagsLiveBefore(select.outer);
+            }
+        }
+        if (flagsLive)
+        {
+            continue;
+        }
         if (fromRelop)
         {
-            GenTree* cmp = m_compiler->gtNewOperNode(GT_CMP, TYP_VOID, cc->gtGetOp1(), cc->gtGetOp2());
+            GenTree* cmp = m_compiler->gtNewOperNode(cc->OperIsCmpCompare() ? GT_CMP : GT_TEST, TYP_VOID,
+                                                   cc->gtGetOp1(), cc->gtGetOp2());
             cmp->gtFlags |= GTF_SET_FLAGS;
             BlockRange().InsertBefore(cc, cmp);
             cmp->gtGetOp1()->ClearContained();
@@ -15549,7 +15564,8 @@ bool Lowering::TryLowerMaskedXorSwap()
             bit = bit->AsCast()->CastOp();
         }
         bool fromAnd = bit->OperIs(GT_AND) && bit->gtGetOp2()->IsIntegralConst(1) && !bit->gtSetFlags();
-        bool fromRelop = bit->OperIsCompare() && bit->gtGetOp1()->TypeIs(TYP_INT, TYP_LONG);
+        bool fromRelop = (bit->OperIsCmpCompare() || bit->OperIs(GT_TEST_EQ, GT_TEST_NE)) &&
+                         bit->gtGetOp1()->TypeIs(TYP_INT, TYP_LONG);
         bool fromCC = bit->OperIs(GT_SETCC) && bit->gtPrev != nullptr && bit->gtPrev->gtSetFlags() &&
                       GenConditionDesc::Get(bit->AsCC()->gtCondition).oper == GT_NONE;
 
@@ -15654,10 +15670,17 @@ bool Lowering::TryLowerMaskedXorSwap()
         if (!valid)
             continue;
 
+#ifdef TARGET_ARM64
+        if ((fromAnd || fromRelop) && AreFlagsLiveBefore(bit))
+        {
+            continue;
+        }
+#endif
         if (fromAnd || fromRelop)
         {
             GenTree *test =
-                m_compiler->gtNewOperNode(fromRelop ? GT_CMP : GT_TEST, TYP_VOID, bit->gtGetOp1(), bit->gtGetOp2());
+                m_compiler->gtNewOperNode(fromRelop && bit->OperIsCmpCompare() ? GT_CMP : GT_TEST, TYP_VOID,
+                                         bit->gtGetOp1(), bit->gtGetOp2());
 
             test->gtFlags |= GTF_SET_FLAGS;
             BlockRange().InsertBefore(bit, test);
@@ -16667,6 +16690,32 @@ bool Lowering::LowerFullAdders()
     }
     return changed;
 }
+
+#ifdef TARGET_ARM64
+//------------------------------------------------------------------------
+// AreFlagsLiveBefore: Check whether inserting a flag producer would destroy an
+// existing flags value. False proves the insertion is safe.
+//
+// A late mask rewrite can introduce a flag producer after carry forwarding.
+// Check consumers before producers because ADCS/SBCS both read and write NZCV.
+// Flags never flow between blocks. Exhausting the bounded scan is conservative.
+bool Lowering::AreFlagsLiveBefore(GenTree* insertion)
+{
+    unsigned budget = 128;
+    for (GenTree* node = insertion; node != nullptr; node = node->gtNext)
+    {
+        if ((budget-- == 0) || node->OperConsumesFlags())
+        {
+            return true;
+        }
+        if (node->gtSetFlags())
+        {
+            return false;
+        }
+    }
+    return false;
+}
+#endif
 
 //------------------------------------------------------------------------
 // IsCarryFlagsCrossing: Check whether a node can sit between a carry producer
