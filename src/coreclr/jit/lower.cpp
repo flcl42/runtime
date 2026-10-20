@@ -17422,6 +17422,14 @@ void Lowering::TryLowerCarryLoop(
         BlockRange().Remove(definition);
     };
     forward(sum, sum->gtGetOp2(), GT_IND);
+#ifdef TARGET_AMD64
+    // Reconsidering containment after forwarding can retain a reg-optional
+    // annotation from the first containment check of this full adder. The
+    // register-optional heuristic requires fresh operands (notably under
+    // REVERSE_FLAG and SPLIT_TREES_REMOVE_COMMAS stress).
+    sum->gtGetOp1()->ClearRegOptional();
+    sum->gtGetOp2()->ClearRegOptional();
+#endif
     ContainCheckBinary(sum->AsOp());
     for (GenTree* node : BlockRange())
     {

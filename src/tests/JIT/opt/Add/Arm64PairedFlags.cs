@@ -163,6 +163,17 @@ public static unsafe class Arm64PairedFlags
             ulong kept = KeepCarry(a, b, h, x, y, r);
             if (kept != unchecked((h ^ x) + c) || r[0] != (ulong)sum || r[1] != (ulong)(otherSum >> 64) || r[2] != (ulong)otherSum)
                 throw new Exception("Paired store used the previous arithmetic flags");
+            kept = KnownAdc(a, b, h, x, y, r);
+            ulong knownHigh = unchecked((h ^ x) + c);
+            if (kept != knownHigh || r[0] != (ulong)sum || r[1] != unchecked(knownHigh + (ulong)(otherSum >> 64)) || r[2] != (ulong)otherSum)
+                throw new Exception("Paired ADC store used known earlier flags");
+            kept = KnownBorrow(a, b, h, x, y, r);
+            if (kept != knownHigh || r[0] != (ulong)sum || r[1] != (x < y ? 1UL : 0UL) || r[2] != unchecked(x - y))
+                throw new Exception("Paired borrow store used known earlier flags");
+            uint known32 = KnownCarry32(aa, bb, (uint)h, (uint)x, (uint)y, r32);
+            ulong other32 = (ulong)(uint)x + (uint)y;
+            if (known32 != unchecked(((uint)h ^ (uint)x) + (uint)(sum32 >> 32)) || r32[0] != (uint)sum32 || r32[1] != (uint)(other32 >> 32) || r32[2] != (uint)other32)
+                throw new Exception("Paired uint carry store used known earlier flags");
             uint h32 = ~(uint)h, high32 = unchecked(h32 + (uint)(sum32 >> 32));
             uint expected32 = unchecked((high32 ^ h32) + high32);
             uint cmp32 = KeepCmp6(aa, bb, (uint)h, (uint)x, (uint)y, r32);
@@ -186,5 +197,35 @@ public static unsafe class Arm64PairedFlags
                 throw new Exception("Paired ulong bit test clobbered carry");
         }
         return 100;
+    }
+
+    // Keep the first carry live through h's update. A wrongly hoisted consumer
+    // of the second operation then reads a known in-method producer, so these
+    // variants cannot pass merely because the caller supplied convenient NZCV.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong KnownAdc(ulong a, ulong b, ulong h, ulong x, ulong y, ulong* r)
+    {
+        ulong s = a + b; r[0] = s; h ^= x;
+        ulong high = h + (s < a ? 1UL : 0UL);
+        ulong u = x + y; r[1] = high + (u < x ? 1UL : 0UL); r[2] = u;
+        return high;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong KnownBorrow(ulong a, ulong b, ulong h, ulong x, ulong y, ulong* r)
+    {
+        ulong s = a + b; r[0] = s; h ^= x;
+        ulong high = h + (s < a ? 1UL : 0UL);
+        ulong d = x - y; r[1] = x < y ? 1UL : 0UL; r[2] = d;
+        return high;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static uint KnownCarry32(uint a, uint b, uint h, uint x, uint y, uint* r)
+    {
+        uint s = a + b; r[0] = s; h ^= x;
+        uint high = h + (s < a ? 1U : 0U);
+        uint u = x + y; r[1] = u < x ? 1U : 0U; r[2] = u;
+        return high;
     }
 }
