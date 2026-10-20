@@ -713,6 +713,7 @@ private:
     unsigned    m_maskSelectScanBudget = 65536; // Node visits for the block rescans of LowerMaskSelects.
 #ifdef TARGET_ARM64
     unsigned    m_arm64RowScanBudget   = 65536; // Reference-link rebuilds after ARM64 row rewrites.
+    bool        m_arm64CarryPostLowering = false; // Only retain distant flags after all block nodes are lowered.
 #endif
 #endif
 

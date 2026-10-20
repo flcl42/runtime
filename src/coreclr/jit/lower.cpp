@@ -12099,7 +12099,9 @@ bool Lowering::TryMakeIndirsAdjacent(GenTreeIndir* prevIndir, GenTreeIndir* indi
 
     m_scratchSideEffects.Clear();
 
-    bool sawData = false;
+    bool sawData             = false;
+    bool movedPreservesFlags = true;
+    bool keptConsumesFlags   = false;
     for (GenTree* cur = prevIndir->gtNext; cur != indir; cur = cur->gtNext)
     {
         if ((cur->gtLIRFlags & LIR::Flags::Mark) != 0)
@@ -12112,6 +12114,7 @@ bool Lowering::TryMakeIndirsAdjacent(GenTreeIndir* prevIndir, GenTreeIndir* indi
                 JITDUMP("Giving up due to moved flags dependency at [%06u]\n", Compiler::dspTreeID(cur));
                 return false;
             }
+            movedPreservesFlags &= IsCarryFlagsCrossing(cur);
             // 'cur' is part of data flow of 'indir', so we will be moving the
             // currently recorded effects past 'cur'.
             if (m_scratchSideEffects.InterferesWith(m_compiler, cur, true))
@@ -12127,10 +12130,21 @@ bool Lowering::TryMakeIndirsAdjacent(GenTreeIndir* prevIndir, GenTreeIndir* indi
         }
         else
         {
+            keptConsumesFlags |= cur->OperConsumesFlags();
             // Not part of dataflow; add its effects that will move past
             // 'indir'.
             m_scratchSideEffects.AddNode(m_compiler, cur);
         }
+    }
+
+    // Value relops and contained SELECT conditions can write NZCV without
+    // GTF_SET_FLAGS. If an existing flags edge ends at a node kept in place,
+    // every moved node must be proven flag-preserving. This still permits
+    // ordinary loads/stores to be paired across carry arithmetic.
+    if (keptConsumesFlags && !movedPreservesFlags)
+    {
+        JITDUMP("Giving up due to a kept flags consumer and a moved potential flags writer\n");
+        return false;
     }
 
     if (m_scratchSideEffects.InterferesWith(m_compiler, indir, true))
@@ -16706,7 +16720,11 @@ bool Lowering::LowerFullAdders()
 //
 // A late mask rewrite can introduce a flag producer after carry forwarding.
 // Check consumers before producers because ADCS/SBCS both read and write NZCV.
-// Flags never flow between blocks. Exhausting the bounded scan is conservative.
+// Carry-loop rewrites do carry flags across seed/loop/finish block boundaries.
+// Their node whitelists exclude mask-producing NEG/XOR/AND nodes, and their
+// synthetic seed/finish blocks contain no masks, so mask candidates cannot
+// occur on those live-out flags edges. Broader loop matching would need an
+// inter-block flags check here. Exhausting the bounded scan is conservative.
 bool Lowering::AreFlagsLiveBefore(GenTree* insertion)
 {
     unsigned budget = 128;
@@ -16862,6 +16880,12 @@ bool Lowering::IsCarryFlagsCrossing(GenTree* node)
 //
 void Lowering::LowerCarryChains()
 {
+#ifdef TARGET_ARM64
+    assert(!m_arm64CarryPostLowering);
+    m_arm64CarryPostLowering = true;
+    auto restoreCarryPhase = [this] { m_arm64CarryPostLowering = false; };
+    jitstd::utility::scoped_code<decltype(restoreCarryPhase)> restorePhase(restoreCarryPhase);
+#endif
     // Match the method-size allowance in LowerFullAdders.
     unsigned budget = 8192;
     for (BasicBlock* block : m_compiler->Blocks())
@@ -17690,6 +17714,15 @@ bool Lowering::TryLowerAddCarry(GenTreeOp* add)
             !IsCarryOperandAvailable(operands[0], availableAt, &moveStart[0]) ||
             (combine && !IsCarryOperandAvailable(operands[1], availableAt, &moveStart[1])))
         {
+#ifdef TARGET_ARM64
+            // During the main walk, a later carry comparison can turn an
+            // intervening non-S ADD/SUB into a flags writer. Only preserve a
+            // distant flags edge after every original block node is lowered.
+            if (!m_arm64CarryPostLowering)
+            {
+                continue;
+            }
+#endif
             // A preceding output store can alias a following input load. Keep
             // the final ADC/SBB at its original position instead of moving the
             // load across that store, provided every surviving node preserves

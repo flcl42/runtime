@@ -65,6 +65,72 @@ public static unsafe class Arm64PairedFlags
         return high;
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static uint KeepCmp6(uint a, uint b, uint h, uint x, uint y, uint* r)
+    {
+        uint s = a + b;
+        r[0] = s;
+        h = ~h;
+        uint high = h + (s < a ? 1U : 0U);
+        r[1] = x < y ? 1U : 0U;
+        return (high ^ h) + high;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong KeepCmp7(ulong a, ulong b, ulong h, ulong x, ulong y, ulong* r)
+    {
+        ulong s = a + b;
+        r[0] = s;
+        h = ~h;
+        ulong high = h + (s < a ? 1UL : 0UL);
+        r[1] = x < y ? 1UL : 0UL;
+        return (high ^ h) + high;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static uint KeepSelect32(uint a, uint b, uint h, uint x, uint y, uint* r)
+    {
+        uint s = a + b;
+        r[0] = s;
+        h = ~h;
+        uint high = h + (s < a ? 1U : 0U);
+        r[1] = x < y ? x : y;
+        return (high ^ h) + high;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong KeepSelect64(ulong a, ulong b, ulong h, ulong x, ulong y, ulong* r)
+    {
+        ulong s = a + b;
+        r[0] = s;
+        h = ~h;
+        ulong high = h + (s < a ? 1UL : 0UL);
+        r[1] = x < y ? x : y;
+        return (high ^ h) + high;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static uint KeepTest32(uint a, uint b, uint h, uint x, uint y, uint* r)
+    {
+        uint s = a + b;
+        r[0] = s;
+        h = ~h;
+        uint high = h + (s < a ? 1U : 0U);
+        r[1] = (x & y) == 0 ? 1U : 0U;
+        return (high ^ h) + high;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong KeepTest64(ulong a, ulong b, ulong h, ulong x, ulong y, ulong* r)
+    {
+        ulong s = a + b;
+        r[0] = s;
+        h = ~h;
+        ulong high = h + (s < a ? 1UL : 0UL);
+        r[1] = (x & y) != 0 ? 1UL : 0UL;
+        return (high ^ h) + high;
+    }
+
     [Fact]
     public static int TestEntryPoint()
     {
@@ -97,6 +163,27 @@ public static unsafe class Arm64PairedFlags
             ulong kept = KeepCarry(a, b, h, x, y, r);
             if (kept != unchecked((h ^ x) + c) || r[0] != (ulong)sum || r[1] != (ulong)(otherSum >> 64) || r[2] != (ulong)otherSum)
                 throw new Exception("Paired store used the previous arithmetic flags");
+            uint h32 = ~(uint)h, high32 = unchecked(h32 + (uint)(sum32 >> 32));
+            uint expected32 = unchecked((high32 ^ h32) + high32);
+            uint cmp32 = KeepCmp6(aa, bb, (uint)h, (uint)x, (uint)y, r32);
+            if (cmp32 != expected32 || r32[0] != (uint)sum32 || r32[1] != ((uint)x < (uint)y ? 1U : 0U))
+                throw new Exception("Paired uint comparison clobbered carry");
+            cmp32 = KeepSelect32(aa, bb, (uint)h, (uint)x, (uint)y, r32);
+            if (cmp32 != expected32 || r32[0] != (uint)sum32 || r32[1] != ((uint)x < (uint)y ? (uint)x : (uint)y))
+                throw new Exception("Paired uint selection clobbered carry");
+            ulong high64 = unchecked(~h + c), expected64 = unchecked((high64 ^ ~h) + high64);
+            ulong cmp64 = KeepCmp7(a, b, h, x, y, r);
+            if (cmp64 != expected64 || r[0] != (ulong)sum || r[1] != (x < y ? 1UL : 0UL))
+                throw new Exception("Paired ulong comparison clobbered carry");
+            cmp64 = KeepSelect64(a, b, h, x, y, r);
+            if (cmp64 != expected64 || r[0] != (ulong)sum || r[1] != (x < y ? x : y))
+                throw new Exception("Paired ulong selection clobbered carry");
+            cmp32 = KeepTest32(aa, bb, (uint)h, (uint)x, (uint)y, r32);
+            if (cmp32 != expected32 || r32[0] != (uint)sum32 || r32[1] != (((uint)x & (uint)y) == 0 ? 1U : 0U))
+                throw new Exception("Paired uint bit test clobbered carry");
+            cmp64 = KeepTest64(a, b, h, x, y, r);
+            if (cmp64 != expected64 || r[0] != (ulong)sum || r[1] != ((x & y) != 0 ? 1UL : 0UL))
+                throw new Exception("Paired ulong bit test clobbered carry");
         }
         return 100;
     }
