@@ -13,10 +13,21 @@ public static class CarryLoopContainment
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static nuint Add(nuint a, nuint b, nuint c, out nuint carry)
     {
-        nuint sum = a + b, high = sum < a ? 1U : 0U;
-        nuint result = sum + c;
-        carry = high + (result < sum ? 1U : 0U);
-        return result;
+        if (IntPtr.Size == 8)
+        {
+            nuint sum = a + b;
+            nuint first = sum < a ? 1 : (nuint)0;
+            nuint result = sum + c;
+            nuint second = result < sum ? 1 : (nuint)0;
+            carry = first + second;
+            return result;
+        }
+        else
+        {
+            ulong sum = (ulong)a + b + c;
+            carry = (uint)(sum >> 32);
+            return (uint)sum;
+        }
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
