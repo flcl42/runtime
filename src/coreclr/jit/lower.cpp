@@ -12104,6 +12104,14 @@ bool Lowering::TryMakeIndirsAdjacent(GenTreeIndir* prevIndir, GenTreeIndir* indi
     {
         if ((cur->gtLIRFlags & LIR::Flags::Mark) != 0)
         {
+            // These nodes move across unrelated nodes. Flags are implicit LIR
+            // dependencies, so SideEffectSet cannot prove such moves safe.
+            // Plain loads/stores may still cross flag-producing arithmetic.
+            if (cur->gtSetFlags() || cur->OperConsumesFlags())
+            {
+                JITDUMP("Giving up due to moved flags dependency at [%06u]\n", Compiler::dspTreeID(cur));
+                return false;
+            }
             // 'cur' is part of data flow of 'indir', so we will be moving the
             // currently recorded effects past 'cur'.
             if (m_scratchSideEffects.InterferesWith(m_compiler, cur, true))
@@ -18002,8 +18010,9 @@ bool Lowering::TryLowerArm64MultiplyCarryRows()
             continue;
         }
         bool valid = true;
-        // The only relocated node is the carry's local read. Its reaching value
-        // must be unchanged between its old position and the first addition.
+        // The carry read moves to the first addition, and the destination's
+        // user moves to the second addition. Both must keep their reaching
+        // local value; in-place destination updates can otherwise overwrite it.
         for (size_t i = begin; valid && i < end; i++)
         {
             Lane& lane = lanes[i];
@@ -18029,6 +18038,29 @@ bool Lowering::TryLowerArm64MultiplyCarryRows()
                 {
                     valid = false;
                     break;
+                }
+            }
+            if (valid && lane.destination->OperIsLocal())
+            {
+                if (!safeLocal(lane.destination))
+                {
+                    valid = false;
+                    break;
+                }
+                unsigned destination = lane.destination->AsLclVar()->GetLclNum();
+                for (GenTree* n = lane.destination->gtNext; n != lane.add[1]; n = n->gtNext)
+                {
+                    if (m_arm64RowScanBudget == 0)
+                    {
+                        return false;
+                    }
+                    m_arm64RowScanBudget--;
+                    if (n == nullptr || (n->OperIsLocalStore() &&
+                        n->AsLclVarCommon()->GetLclNum() == destination))
+                    {
+                        valid = false;
+                        break;
+                    }
                 }
             }
         }
@@ -18310,6 +18342,24 @@ void Lowering::TryLowerArm64MultiplyCarryLoop()
         for (GenTree* node = lane.add[0]; node != lane.carry; node = node->gtNext)
         {
             if (node == nullptr || (node->OperIsLocalStore() && node->AsLclVarCommon()->GetLclNum() == carryLocal))
+            {
+                return;
+            }
+        }
+        // Like the straight-line rewrite, this pass changes the destination
+        // read's user to the second addition. Preserve its reaching value.
+        unsigned destination = lane.destination->AsLclVar()->GetLclNum();
+        LclVarDsc* destinationDsc = m_compiler->lvaGetDesc(destination);
+        if (destinationDsc->IsAddressExposed())
+        {
+            return;
+        }
+        for (GenTree* node = lane.destination->gtNext; node != lane.add[1]; node = node->gtNext)
+        {
+            if (node == nullptr ||
+                (node->OperIsLocalStore() && node->AsLclVarCommon()->GetLclNum() == destination) ||
+                (destinationDsc->lvIsStructField && node->OperIsLocal() &&
+                 node->AsLclVarCommon()->GetLclNum() == destinationDsc->lvParentLcl))
             {
                 return;
             }
