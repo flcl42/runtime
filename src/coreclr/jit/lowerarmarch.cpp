@@ -125,6 +125,7 @@ bool Lowering::IsContainableImmed(GenTree* parentNode, GenTree* childNode) const
             case GT_XOR:
             case GT_TEST_EQ:
             case GT_TEST_NE:
+            case GT_TEST:
                 return emitter::emitIns_valid_imm_for_alu(immVal, size);
             case GT_JCMP:
                 assert(immVal == 0);

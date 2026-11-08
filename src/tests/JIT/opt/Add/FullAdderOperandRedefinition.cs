@@ -5,7 +5,7 @@
 // carry addition that reuses the first addition's operand reads. The operands must
 // still hold the same values at the second addition: a redefinition of a or b in
 // between (direct, through a load, or through a promoted parent) must keep the
-// explicit carry representation. In-place accumulation (acc += b; acc += c) only
+// explicit carry representation; the subtractor form has the same hazard. In-place accumulation (acc += b; acc += c) only
 // redefines the first sum itself and must still fold.
 using System;
 using System.Runtime.CompilerServices;
@@ -102,6 +102,22 @@ public static unsafe class FullAdderOperandRedefinition
         return c;
     }
 
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static ulong RedefineSubtrahend(ulong a0, ulong b0, ulong a1, ulong b1, ulong w, ulong* r)
+    {
+        ulong s0 = a0 - b0;
+        ulong c = a0 < b0 ? 1UL : 0UL;
+        ulong s = a1 - b1;
+        ulong k = a1 < b1 ? 1UL : 0UL;
+        b1 ^= w;
+        ulong t = s - c;
+        c = k + (s < c ? 1UL : 0UL);
+        r[0] = s0;
+        r[1] = t;
+        r[2] = b1;
+        return c;
+    }
+
     private static readonly ulong[] Values =
     {
         0, 1, 2, 0x7FFFFFFFFFFFFFFFUL, 0x8000000000000000UL, ulong.MaxValue - 1, ulong.MaxValue, 0x123456789ABCDEF0UL
@@ -145,6 +161,18 @@ public static unsafe class FullAdderOperandRedefinition
             if (got != c1 || r[1] != t1 || r[2] != w + a1)
             {
                 if (errors++ < 4) Console.WriteLine($"RedefineThroughParent({a0:x},{b0:x},{a1:x},{b1:x},{w:x}): {got},{r[1]:x} expected {c1},{t1:x}");
+            }
+
+            got = RedefineSubtrahend(a0, b0, a1, b1, w, r);
+            {
+                ulong d0 = a0 - b0, borrow0 = a0 < b0 ? 1UL : 0UL;
+                ulong d1 = a1 - b1, borrow1 = a1 < b1 ? 1UL : 0UL;
+                ulong t2 = d1 - borrow0;
+                ulong borrowOut = borrow1 + (d1 < borrow0 ? 1UL : 0UL);
+                if (got != borrowOut || r[0] != d0 || r[1] != t2 || r[2] != (b1 ^ w))
+                {
+                    if (errors++ < 4) Console.WriteLine($"RedefineSubtrahend({a0:x},{b0:x},{a1:x},{b1:x},{w:x}): {got},{r[1]:x} expected {borrowOut},{t2:x}");
+                }
             }
 
             got = AccumulateInPlace(a0, b0, a1, b1, r);
