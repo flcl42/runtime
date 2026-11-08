@@ -16433,6 +16433,75 @@ bool Lowering::LowerFullAdders()
                 continue;
             }
 
+            // The rewrite makes the second addition consume the first addition's operand
+            // nodes, which stay at their original positions. Each operand must still have
+            // the same value at the second addition: a local must not be redefined in
+            // between, directly or through its promoted parent, apart from the store of the
+            // first result that the rewrite removes; any other operand must be invariant
+            // up to the second addition.
+            bool operandsAvailable = true;
+            for (GenTree* operand : first->Operands())
+            {
+                bool               isClosed;
+                LIR::ReadOnlyRange operandRange = BlockRange().GetTreeRange(operand, &isClosed);
+                if (!isClosed)
+                {
+                    operandsAvailable = false;
+                    break;
+                }
+                for (GenTree* node : operandRange)
+                {
+                    if (node->OperIs(GT_LCL_VAR))
+                    {
+                        unsigned   operandLocal = node->AsLclVar()->GetLclNum();
+                        LclVarDsc* operandDsc   = m_compiler->lvaGetDesc(operandLocal);
+                        if (operandDsc->IsAddressExposed())
+                        {
+                            operandsAvailable = false;
+                            break;
+                        }
+                        for (GenTree* between = first->gtNext; between != second; between = between->gtNext)
+                        {
+                            if (!between->OperIsLocalStore())
+                            {
+                                continue;
+                            }
+                            unsigned storedLocal = between->AsLclVarCommon()->GetLclNum();
+                            if ((storedLocal != operandLocal) &&
+                                (!operandDsc->lvIsStructField || (storedLocal != operandDsc->lvParentLcl)))
+                            {
+                                continue;
+                            }
+                            // The first addition's own result store is removed by the rewrite.
+                            if (between->OperIs(GT_STORE_LCL_VAR) && (between->gtGetOp1() == first))
+                            {
+                                continue;
+                            }
+                            operandsAvailable = false;
+                            break;
+                        }
+                    }
+                    else if (node->OperIsLocal() || (!node->IsCnsIntOrI() && !IsInvariantInRange(node, second)))
+                    {
+                        operandsAvailable = false;
+                    }
+                    if (!operandsAvailable)
+                    {
+                        break;
+                    }
+                }
+                if (!operandsAvailable)
+                {
+                    break;
+                }
+            }
+            if (!operandsAvailable)
+            {
+                JITDUMP("Full adders: operands of [%06u] are not available at [%06u]\n", first->gtTreeID,
+                        second->gtTreeID);
+                continue;
+            }
+
             for (unsigned i = 0; i < (subtract ? 1u : 2u); i++)
             {
                 GenTree* read  = i == 0 ? second->gtGetOp1() : second->gtGetOp2();
